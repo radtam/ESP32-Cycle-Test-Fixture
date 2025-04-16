@@ -1,0 +1,135 @@
+#include <Arduino.h>
+#include <AccelStepper.h>
+
+// Define pins
+#define STEP_PIN 26
+#define DIR_PIN 27
+#define ENABLE_PIN 25
+
+// Steps per inch: 400 steps = 5 inches -> 80 steps/inch
+const float STEPS_PER_INCH = 80.0;
+
+// Define stepper motor (1 = driver, DIR_PIN, STEP_PIN)
+AccelStepper stepper(1, STEP_PIN, DIR_PIN);
+
+// G-code commands to execute
+String gcode[] = {
+  "G01 X100 F10",   // Move forward 100 inches at 10 inches/sec
+  "G02 W5",         // Wait 5 seconds
+  "G01 X-100 F10",  // Move backward 100 inches at 10 inches/sec
+  "G02 W5",         // Wait 5 seconds
+  "G03 C1000"       // Repeat the above sequence 1000 times
+};
+
+// Current position in inches (for absolute positioning)
+float currentPosition = 0.0;
+
+void setup() {
+  // Initialize serial for debugging
+  Serial.begin(115200);
+
+  // Configure stepper
+  stepper.setMaxSpeed(1000);           // Max speed in steps/sec
+  stepper.setAcceleration(1000);       // Acceleration in steps/sec^2
+  pinMode(ENABLE_PIN, OUTPUT);
+  digitalWrite(ENABLE_PIN, LOW);       // Enable the driver (active low)
+
+  // Process each G-code command
+  for (int i = 0; i < sizeof(gcode) / sizeof(gcode[0]); i++) {
+    executeGCode(gcode[i], i);
+  }
+}
+
+void loop() {
+  // Run stepper to reach target position
+  stepper.run();
+}
+
+// Parse and execute a single G-code command
+void executeGCode(String command, int commandIndex) {
+  command.trim(); // Remove leading/trailing whitespace
+
+  if (command.startsWith("G01")) {
+    // Parse G01 X<distance> F<feedrate>
+    float distance = 0.0;
+    float feedrate = 0.0;
+
+    // Extract X value
+    int xIndex = command.indexOf('X');
+    int fIndex = command.indexOf('F');
+    if (xIndex != -1 && fIndex != -1) {
+      String xStr = command.substring(xIndex + 1, fIndex);
+      String fStr = command.substring(fIndex + 1);
+      distance = xStr.toFloat();
+      feedrate = fStr.toFloat();
+    } else {
+      Serial.println("Error parsing G01 command: " + command);
+      return;
+    }
+
+    // Convert distance to steps (absolute positioning)
+    long targetSteps = (long)(distance * STEPS_PER_INCH);
+    long currentSteps = (long)(currentPosition * STEPS_PER_INCH);
+    long relativeSteps = targetSteps - currentSteps;
+
+    // Convert feedrate to steps/sec
+    float speed = feedrate * STEPS_PER_INCH;
+
+    // Set stepper parameters
+    stepper.setMaxSpeed(speed);
+    stepper.moveTo(targetSteps); // Absolute position in steps
+
+    // Update current position
+    currentPosition = distance;
+
+    Serial.printf("G01: Moving to %.2f inches (%.0f steps) at %.2f inches/sec\n", 
+                  distance, (float)targetSteps, feedrate);
+
+    // Run until movement is complete
+    while (stepper.distanceToGo() != 0) {
+      stepper.run();
+    }
+
+  } else if (command.startsWith("G02")) {
+    // Parse G02 W<seconds>
+    float waitTime = 0.0;
+    int wIndex = command.indexOf('W');
+    if (wIndex != -1) {
+      String wStr = command.substring(wIndex + 1);
+      waitTime = wStr.toFloat();
+    } else {
+      Serial.println("Error parsing G02 command: " + command);
+      return;
+    }
+
+    // Wait for specified time
+    Serial.printf("G02: Waiting for %.2f seconds\n", waitTime);
+    delay((unsigned long)(waitTime * 1000));
+
+  } else if (command.startsWith("G03")) {
+    // Parse G03 C<cycles>
+    long cycles = 0;
+    int cIndex = command.indexOf('C');
+    if (cIndex != -1) {
+      String cStr = command.substring(cIndex + 1);
+      cycles = cStr.toInt();
+    } else {
+      Serial.println("Error parsing G03 command: " + command);
+      return;
+    }
+
+    Serial.printf("G03: Repeating sequence %ld times\n", cycles);
+
+    // Repeat the G-code sequence (excluding G03) for the specified number of cycles
+    for (long cycle = 0; cycle < cycles; cycle++) {
+      Serial.printf("Starting cycle %ld of %ld\n", cycle + 1, cycles);
+      // Execute all commands before G03
+      for (int i = 0; i < commandIndex; i++) {
+        executeGCode(gcode[i], i);
+      }
+    }
+
+  } else {
+    Serial.println("Unknown G-code: " + command);
+  }
+}
