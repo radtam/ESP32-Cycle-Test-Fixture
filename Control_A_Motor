@@ -1,32 +1,95 @@
 #include <Arduino.h>
 #include <AccelStepper.h>
+#include <HX711.h>
 
-// Define pins
+// Define stepper motor pins
 #define STEP_PIN 26
 #define DIR_PIN 27
 #define ENABLE_PIN 25
 
-// Steps per inch: 400 steps = 5 inches -> 80 steps/inch
-const float STEPS_PER_INCH = 80.0;
+// Define load cell pins
+#define LOADCELL_DOUT_PIN 32
+#define LOADCELL_SCK_PIN 33
+
+// Steps per inch: 200 steps = 5 inches -> 40 steps/inch
+const float STEPS_PER_INCH = 40.0;
+
+// Load cell calibration parameters (adjust these after calibration)
+const float LOADCELL_DIVIDER = 100.0; // Example scale factor
+const float LOADCELL_OFFSET = 0.0;    // Example offset
 
 // Define stepper motor (1 = driver, DIR_PIN, STEP_PIN)
 AccelStepper stepper(1, STEP_PIN, DIR_PIN);
 
+// Define load cell
+HX711 loadCell;
+
 // G-code commands to execute
 String gcode[] = {
-  "G01 X100 F10",   // Move forward 100 inches at 10 inches/sec
-  "G02 W5",         // Wait 5 seconds
-  "G01 X-100 F10",  // Move backward 100 inches at 10 inches/sec
-  "G02 W5",         // Wait 5 seconds
-  "G03 C1000"       // Repeat the above sequence 1000 times
+  "G01 X100 F10 RLC10",  // Move forward 100 inches at 10 inches/sec, 10 load cell readings
+  "G02 W5",              // Wait 5 seconds
+  "G01 X-100 F10 RLC10", // Move backward 100 inches at 10 inches/sec, 10 load cell readings
+  "G02 W5",              // Wait 5 seconds
+  "G03 C1000"            // Repeat the above sequence 1000 times
 };
 
 // Current position in inches (for absolute positioning)
 float currentPosition = 0.0;
 
+// Load cell reading control
+volatile bool takeReadings = false;
+volatile int readingCount = 0;
+volatile float startPosition = 0.0;
+volatile float targetPosition = 0.0;
+
+// Task handles
+TaskHandle_t Task1;
+
+// Load cell reading task (runs on Core 1)
+void loadCellTask(void *parameter) {
+  for (;;) {
+    if (takeReadings && readingCount > 0) {
+      // Take 5 readings and average them
+      float sum = 0.0;
+      for (int i = 0; i < 5; i++) {
+        sum += loadCell.get_units(1); // Single reading in units
+      }
+      float averageReading = sum / 5.0;
+
+      // Estimate position (linear interpolation)
+      int currentReadingIndex = readingCount; // Snapshot to avoid race condition
+      float progress = (readingCount == 10) ? 0.0 : (float)(10 - readingCount) / 9.0; // 10 readings, 9 intervals
+      if (readingCount == 1) progress = 1.0; // Last reading after stop
+      float estimatedPosition = startPosition + (targetPosition - startPosition) * (1.0 - progress);
+
+      // Print reading and estimated position
+      Serial.printf("Load Cell Reading %d: %.2f units at estimated position %.2f inches\n",
+                    11 - readingCount, averageReading, estimatedPosition);
+
+      // Decrement reading count
+      readingCount--;
+
+      // Stop readings after the last one
+      if (readingCount == 0) {
+        takeReadings = false;
+      }
+
+      // Delay to space readings (adjusted for movement duration)
+      vTaskDelay(900 / portTICK_PERIOD_MS); // ~0.9 sec for 9 intervals over 10 sec
+    } else {
+      vTaskDelay(10 / portTICK_PERIOD_MS); // Yield when idle
+    }
+  }
+}
+
 void setup() {
   // Initialize serial for debugging
   Serial.begin(115200);
+
+  // Initialize load cell
+  loadCell.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+  loadCell.set_scale(LOADCELL_DIVIDER);
+  loadCell.set_offset(LOADCELL_OFFSET);
 
   // Configure stepper
   stepper.setMaxSpeed(1000);           // Max speed in steps/sec
@@ -34,14 +97,25 @@ void setup() {
   pinMode(ENABLE_PIN, OUTPUT);
   digitalWrite(ENABLE_PIN, LOW);       // Enable the driver (active low)
 
-  // Process each G-code command
+  // Create load cell task on Core 1
+  xTaskCreatePinnedToCore(
+    loadCellTask,    // Task function
+    "LoadCellTask",  // Task name
+    10000,           // Stack size
+    NULL,            // Parameter
+    1,               // Priority
+    &Task1,          // Task handle
+    1                // Core 1
+  );
+
+  // Process each G-code command (runs on Core 0)
   for (int i = 0; i < sizeof(gcode) / sizeof(gcode[0]); i++) {
     executeGCode(gcode[i], i);
   }
 }
 
 void loop() {
-  // Run stepper to reach target position
+  // Run stepper to reach target position (runs on Core 0)
   stepper.run();
 }
 
@@ -50,18 +124,24 @@ void executeGCode(String command, int commandIndex) {
   command.trim(); // Remove leading/trailing whitespace
 
   if (command.startsWith("G01")) {
-    // Parse G01 X<distance> F<feedrate>
+    // Parse G01 X<distance> F<feedrate> [RLC<count>]
     float distance = 0.0;
     float feedrate = 0.0;
+    int rlcCount = 0;
 
-    // Extract X value
+    // Extract X, F, and RLC values
     int xIndex = command.indexOf('X');
     int fIndex = command.indexOf('F');
+    int rlcIndex = command.indexOf("RLC");
     if (xIndex != -1 && fIndex != -1) {
       String xStr = command.substring(xIndex + 1, fIndex);
-      String fStr = command.substring(fIndex + 1);
+      String fStr = (rlcIndex != -1) ? command.substring(fIndex + 1, rlcIndex) : command.substring(fIndex + 1);
       distance = xStr.toFloat();
       feedrate = fStr.toFloat();
+      if (rlcIndex != -1) {
+        String rlcStr = command.substring(rlcIndex + 3);
+        rlcCount = rlcStr.toInt();
+      }
     } else {
       Serial.println("Error parsing G01 command: " + command);
       return;
@@ -79,6 +159,20 @@ void executeGCode(String command, int commandIndex) {
     stepper.setMaxSpeed(speed);
     stepper.moveTo(targetSteps); // Absolute position in steps
 
+    // Handle load cell readings if RLC is specified
+    if (rlcCount > 0) {
+      // Take first reading before movement
+      startPosition = currentPosition;
+      targetPosition = distance;
+      readingCount = rlcCount; // Includes pre-move and post-move readings
+      takeReadings = true;
+
+      // Wait for first reading to complete
+      while (readingCount == rlcCount) {
+        vTaskDelay(10 / portTICK_PERIOD_MS); // Wait for load cell task
+      }
+    }
+
     // Update current position
     currentPosition = distance;
 
@@ -88,6 +182,13 @@ void executeGCode(String command, int commandIndex) {
     // Run until movement is complete
     while (stepper.distanceToGo() != 0) {
       stepper.run();
+    }
+
+    // Ensure last reading is taken after movement stops
+    if (rlcCount > 0) {
+      while (takeReadings) {
+        vTaskDelay(10 / portTICK_PERIOD_MS); // Wait for final reading
+      }
     }
 
   } else if (command.startsWith("G02")) {
