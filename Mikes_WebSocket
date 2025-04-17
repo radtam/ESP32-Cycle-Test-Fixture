@@ -1,0 +1,91 @@
+// Include necessary libraries for WiFi and WebSocket functionality
+#include <WiFi.h>
+#include <WebSocketsClient.h> //arduinoWebSockets library
+#include <ArduinoJson.h>      // Library for JSON handling
+
+// WiFi and WebSocket connection constants
+const char* ssid = "Test lab";         // WiFi network name
+const char* password = "Mu$t4ng!";     // WiFi password
+const char* ws_host = "192.168.86.93"; // WebSocket server IP address
+const int ws_port = 8080;              // WebSocket server port
+
+WebSocketsClient webSocket;            // Create WebSocket client object
+
+// WebSocket event handler function
+void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
+    switch (type) {
+        // Handle disconnection event
+        case WStype_DISCONNECTED:
+            Serial.println("[WS] Disconnected!");
+            break;
+        // Handle successful connection
+        case WStype_CONNECTED:
+            Serial.println("[WS] Connected to server!");
+            break;
+        // Handle received text messages
+        case WStype_TEXT:
+            Serial.printf("[WS] Received: %s\n", payload);
+            break;
+        // Handle error events
+        case WStype_ERROR:
+            Serial.println("[WS] Error!");
+            break;
+        // Handle ping from server
+        case WStype_PING:
+            Serial.println("[WS] Ping received");
+            break;
+        // Handle pong response
+        case WStype_PONG:
+            Serial.println("[WS] Pong sent");
+            break;
+    }
+}
+
+// Setup function - runs once at startup
+void setup() {
+    Serial.begin(115200);    // Initialize serial communication at 115200 baud
+    delay(1000);            // Short delay to allow serial to stabilize
+
+    // Connect to WiFi network
+    WiFi.begin(ssid, password);
+    Serial.print("Connecting to Wi-Fi");
+    // Wait for WiFi connection
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");  // Print dots while connecting
+    }
+    // Print connection confirmation and IP address
+    Serial.println("\nConnected! IP: " + WiFi.localIP().toString());
+
+    // Initialize WebSocket connection
+    webSocket.begin(ws_host, ws_port, "/");    // Connect to server with root path
+    webSocket.onEvent(onWebSocketEvent);       // Register event handler
+    webSocket.setReconnectInterval(2000);      // Set auto-reconnect interval to 2 seconds
+}
+
+// Main loop - runs continuously
+void loop() {
+    webSocket.loop();    // Handle WebSocket events and maintain connection
+
+    // Check and handle WiFi disconnection
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi disconnected! Attempting reconnect...");
+        WiFi.reconnect();
+    }
+
+    static unsigned long lastSend = 0;    // Track last message send time
+    // Send JSON data every 5 seconds when connected
+    if (millis() - lastSend > 5000 && webSocket.isConnected()) {
+        StaticJsonDocument<200> doc;      // Create JSON document with 200 byte capacity
+        JsonArray array = doc.to<JsonArray>();    // Create JSON array
+        JsonObject obj = array.createNestedObject();    // Create nested object
+        obj["x"] = random(0, 100);        // Add random x value (0-99)
+        obj["y"] = random(0, 100);        // Add random y value (0-99)
+        
+        String json;                      // String to hold serialized JSON
+        serializeJson(doc, json);         // Convert JSON to string
+        webSocket.sendTXT(json);          // Send JSON string via WebSocket
+        Serial.println("Sent: " + json);  // Log sent message
+        lastSend = millis();              // Update last send time
+    }
+}
