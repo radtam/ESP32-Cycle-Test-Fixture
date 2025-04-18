@@ -37,10 +37,9 @@ String gcode[] = {
 float currentPosition = 0.0;
 
 // Load cell reading control
-volatile bool takeReadings = false;
-volatile int readingCount = 0;
-volatile float startPosition = 0.0;
-volatile float targetPosition = 0.0;
+volatile bool triggerReading = false;
+volatile float motorPosition = 0.0;
+volatile int readingIndex = 0;
 
 // Task handles
 TaskHandle_t Task1;
@@ -48,7 +47,7 @@ TaskHandle_t Task1;
 // Load cell reading task (runs on Core 1)
 void loadCellTask(void *parameter) {
   for (;;) {
-    if (takeReadings && readingCount > 0) {
+    if (triggerReading) {
       // Take 5 readings and average them
       float sum = 0.0;
       for (int i = 0; i < 5; i++) {
@@ -56,29 +55,17 @@ void loadCellTask(void *parameter) {
       }
       float averageReading = sum / 5.0;
 
-      // Estimate position (linear interpolation)
-      int currentReadingIndex = readingCount; // Snapshot to avoid race condition
-      float progress = (readingCount == 10) ? 0.0 : (float)(10 - readingCount) / 9.0; // 10 readings, 9 intervals
-      if (readingCount == 1) progress = 1.0; // Last reading after stop
-      float estimatedPosition = startPosition + (targetPosition - startPosition) * (1.0 - progress);
+      // Record current motor position
+      float recordedPosition = motorPosition;
 
-      // Print reading and estimated position
-      Serial.printf("Load Cell Reading %d: %.2f units at estimated position %.2f inches\n",
-                    11 - readingCount, averageReading, estimatedPosition);
+      // Print reading and actual position
+      Serial.printf("Load Cell Reading %d: %.2f units at position %.2f inches\n",
+                    readingIndex, averageReading, recordedPosition);
 
-      // Decrement reading count
-      readingCount--;
-
-      // Stop readings after the last one
-      if (readingCount == 0) {
-        takeReadings = false;
-      }
-
-      // Delay to space readings (adjusted for movement duration)
-      vTaskDelay(900 / portTICK_PERIOD_MS); // ~0.9 sec for 9 intervals over 10 sec
-    } else {
-      vTaskDelay(10 / portTICK_PERIOD_MS); // Yield when idle
+      // Reset trigger
+      triggerReading = false;
     }
+    vTaskDelay(10 / portTICK_PERIOD_MS); // Yield when idle
   }
 }
 
@@ -162,14 +149,44 @@ void executeGCode(String command, int commandIndex) {
     // Handle load cell readings if RLC is specified
     if (rlcCount > 0) {
       // Take first reading before movement
-      startPosition = currentPosition;
-      targetPosition = distance;
-      readingCount = rlcCount; // Includes pre-move and post-move readings
-      takeReadings = true;
+      motorPosition = currentPosition;
+      readingIndex = 1;
+      triggerReading = true;
 
-      // Wait for first reading to complete
-      while (readingCount == rlcCount) {
-        vTaskDelay(10 / portTICK_PERIOD_MS); // Wait for load cell task
+      // Calculate timing for intermediate readings (rlcCount - 2 readings over movement duration)
+      float movementDuration = abs(relativeSteps) / speed; // Seconds
+      float readingInterval = (rlcCount > 2) ? (movementDuration / (rlcCount - 1)) : 0;
+      unsigned long lastReadingTime = millis();
+      int readingsTaken = 1; // First reading triggered
+
+      // Move and take intermediate readings
+      while (stepper.distanceToGo() != 0) {
+        stepper.run();
+        // Update motor position
+        motorPosition = stepper.currentPosition() / STEPS_PER_INCH;
+
+        // Check if it's time for the next reading
+        if (readingsTaken < rlcCount - 1 && (millis() - lastReadingTime) >= (readingInterval * 1000)) {
+          readingIndex = readingsTaken + 1;
+          triggerReading = true;
+          lastReadingTime = millis();
+          readingsTaken++;
+        }
+      }
+
+      // Ensure movement completes
+      while (stepper.distanceToGo() != 0) {
+        stepper.run();
+      }
+
+      // Take final reading after movement
+      motorPosition = stepper.currentPosition() / STEPS_PER_INCH;
+      readingIndex = rlcCount;
+      triggerReading = true;
+    } else {
+      // Move without readings
+      while (stepper.distanceToGo() != 0) {
+        stepper.run();
       }
     }
 
@@ -178,18 +195,6 @@ void executeGCode(String command, int commandIndex) {
 
     Serial.printf("G01: Moving to %.2f inches (%.0f steps) at %.2f inches/sec\n", 
                   distance, (float)targetSteps, feedrate);
-
-    // Run until movement is complete
-    while (stepper.distanceToGo() != 0) {
-      stepper.run();
-    }
-
-    // Ensure last reading is taken after movement stops
-    if (rlcCount > 0) {
-      while (takeReadings) {
-        vTaskDelay(10 / portTICK_PERIOD_MS); // Wait for final reading
-      }
-    }
 
   } else if (command.startsWith("G02")) {
     // Parse G02 W<seconds>
