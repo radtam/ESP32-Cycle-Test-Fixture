@@ -1,0 +1,348 @@
+#include <Arduino.h>
+#include <AccelStepper.h>
+#include <HX711.h>
+#include <WiFi.h>
+#include <WebSocketsClient.h>
+#include <ArduinoJson.h>
+
+// Define stepper motor pins
+#define STEP_PIN 26
+#define DIR_PIN 27
+#define ENABLE_PIN 25
+
+// Define load cell pins
+#define LOADCELL_DOUT_PIN 32
+#define LOADCELL_SCK_PIN 33
+
+// Steps per inch: 400 steps = 5 inches -> 80 steps/inch
+const float STEPS_PER_INCH = 80.0;
+
+// Load cell calibration parameters (adjust these after calibration)
+const float LOADCELL_DIVIDER = 100.0; // Example scale factor
+const float LOADCELL_OFFSET = 0.0;    // Example offset
+
+// WiFi and WebSocket connection constants
+const char* ssid = "Test lab";         // WiFi network name
+const char* password = "Mu$t4ng!";     // WiFi password
+const char* ws_host = "192.168.86.100"; // WebSocket server IP address
+const int ws_port = 8080;              // WebSocket server port
+
+// Define stepper motor (1 = driver, DIR_PIN, STEP_PIN)
+AccelStepper stepper(1, STEP_PIN, DIR_PIN);
+
+// Define load cell
+HX711 loadCell;
+
+// Define WebSocket client
+WebSocketsClient webSocket;
+
+// G-code commands to execute
+String gcode[] = {
+  "G01 X100 F10 RLC10",  // Move forward 100 inches at 10 inches/sec, 10 load cell readings
+  "G02 W5",              // Wait 5 seconds
+  "G01 X-100 F10 RLC10", // Move backward 100 inches at 10 inches/sec, 10 load cell readings
+  "G02 W5",              // Wait 5 seconds
+  "G03 C1000"            // Repeat the above sequence 1000 times
+};
+
+// Current position in inches (for absolute positioning)
+float currentPosition = 0.0;
+
+// Load cell reading control
+volatile bool triggerReading = false;
+volatile float motorPosition = 0.0;
+volatile int readingIndex = 0;
+
+// Flag to start G-code execution
+volatile bool startGCode = false;
+
+// Task handles
+TaskHandle_t Task1;
+
+// WebSocket event handler function
+void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
+  switch (type) {
+    case WStype_DISCONNECTED:
+      Serial.println("[WS] Disconnected!");
+      break;
+    case WStype_CONNECTED:
+      Serial.println("[WS] Connected to server!");
+      break;
+    case WStype_TEXT: {
+      Serial.printf("[WS] Received: %s\n", payload);
+      // Parse JSON message
+      StaticJsonDocument<200> doc;
+      DeserializationError error = deserializeJson(doc, payload);
+      if (error) {
+        Serial.println("[WS] JSON parsing failed: " + String(error.c_str()));
+        return;
+      }
+      // Check for "start cycle" command
+      const char* command = doc["command"];
+      if (command && strcmp(command, "start cycle") == 0) {
+        Serial.println("[WS] Start cycle command received!");
+        startGCode = true;
+      }
+      break;
+    }
+    case WStype_ERROR:
+      Serial.println("[WS] Error!");
+      break;
+    case WStype_PING:
+      Serial.println("[WS] Ping received");
+      break;
+    case WStype_PONG:
+      Serial.println("[WS] Pong sent");
+      break;
+  }
+}
+
+// Load cell reading task (runs on Core 1)
+void loadCellTask(void *parameter) {
+  for (;;) {
+    if (triggerReading) {
+      // Take 5 readings and average them
+      float sum = 0.0;
+      for (int i = 0; i < 5; i++) {
+        sum += loadCell.get_units(1); // Single reading in units
+      }
+      float averageReading = sum / 5.0;
+
+      // Record current motor position
+      float recordedPosition = motorPosition;
+
+      // Print reading and actual position
+      Serial.printf("Load Cell Reading %d: %.2f units at position %.2f inches\n",
+                    readingIndex, averageReading, recordedPosition);
+
+      // Send JSON data over WebSocket
+      if (webSocket.isConnected()) {
+        StaticJsonDocument<200> doc;
+        doc["position"] = recordedPosition;
+        doc["load"] = averageReading;
+        String json;
+        serializeJson(doc, json);
+        webSocket.sendTXT(json);
+        Serial.println("Sent: " + json);
+      }
+
+      // Reset trigger
+      triggerReading = false;
+    }
+    vTaskDelay(10 / portTICK_PERIOD_MS); // Yield when idle
+  }
+}
+
+void setup() {
+  // Initialize serial for debugging
+  Serial.begin(115200);
+  delay(1000); // Short delay to allow serial to stabilize
+
+  // Connect to WiFi network
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to Wi-Fi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nConnected! IP: " + WiFi.localIP().toString());
+
+  // Initialize WebSocket connection
+  webSocket.begin(ws_host, ws_port, "/");
+  webSocket.onEvent(onWebSocketEvent);
+  webSocket.setReconnectInterval(2000);
+
+  // Initialize load cell
+  loadCell.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+  loadCell.set_scale(LOADCELL_DIVIDER);
+  loadCell.set_offset(LOADCELL_OFFSET);
+
+  // Configure stepper
+  stepper.setMaxSpeed(1000);           // Max speed in steps/sec
+  stepper.setAcceleration(1000);       // Acceleration in steps/sec^2
+  pinMode(ENABLE_PIN, OUTPUT);
+  digitalWrite(ENABLE_PIN, LOW);       // Enable the driver (active low)
+
+  // Create load cell task on Core 1
+  xTaskCreatePinnedToCore(
+    loadCellTask,    // Task function
+    "LoadCellTask",  // Task name
+    10000,           // Stack size
+    NULL,            // Parameter
+    1,               // Priority
+    &Task1,          // Task handle
+    1                // Core 1
+  );
+
+  // Wait for "start cycle" from Serial or WebSocket
+  Serial.println("Enter 'start cycle' or send JSON {'command': 'start cycle'} via WebSocket:");
+  while (!startGCode) {
+    // Check Serial input
+    if (Serial.available()) {
+      String input = Serial.readStringUntil('\n');
+      input.trim();
+      if (input.equalsIgnoreCase("start cycle")) {
+        Serial.println("Starting G-code execution (via Serial)...");
+        startGCode = true;
+      } else {
+        Serial.println("Invalid input. Enter 'start cycle' or use WebSocket:");
+      }
+    }
+    // Handle WebSocket events
+    webSocket.loop();
+    vTaskDelay(10 / portTICK_PERIOD_MS); // Yield to avoid blocking
+  }
+
+  // Process each G-code command (runs on Core 0)
+  for (int i = 0; i < sizeof(gcode) / sizeof(gcode[0]); i++) {
+    executeGCode(gcode[i], i);
+  }
+}
+
+void loop() {
+  // Run stepper to reach target position (runs on Core 0)
+  stepper.run();
+
+  // Handle WebSocket events
+  webSocket.loop();
+
+  // Check and handle WiFi disconnection
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi disconnected! Attempting reconnect...");
+    WiFi.reconnect();
+  }
+}
+
+// Parse and execute a single G-code command
+void executeGCode(String command, int commandIndex) {
+  command.trim(); // Remove leading/trailing whitespace
+
+  if (command.startsWith("G01")) {
+    // Parse G01 X<distance> F<feedrate> [RLC<count>]
+    float distance = 0.0;
+    float feedrate = 0.0;
+    int rlcCount = 0;
+
+    // Extract X, F, and RLC values
+    int xIndex = command.indexOf('X');
+    int fIndex = command.indexOf('F');
+    int rlcIndex = command.indexOf("RLC");
+    if (xIndex != -1 && fIndex != -1) {
+      String xStr = command.substring(xIndex + 1, fIndex);
+      String fStr = (rlcIndex != -1) ? command.substring(fIndex + 1, rlcIndex) : command.substring(fIndex + 1);
+      distance = xStr.toFloat();
+      feedrate = fStr.toFloat();
+      if (rlcIndex != -1) {
+        String rlcStr = command.substring(rlcIndex + 3);
+        rlcCount = rlcStr.toInt();
+      }
+    } else {
+      Serial.println("Error parsing G01 command: " + command);
+      return;
+    }
+
+    // Convert distance to steps (absolute positioning)
+    long targetSteps = (long)(distance * STEPS_PER_INCH);
+    long currentSteps = (long)(currentPosition * STEPS_PER_INCH);
+    long relativeSteps = targetSteps - currentSteps;
+
+    // Convert feedrate to steps/sec
+    float speed = feedrate * STEPS_PER_INCH;
+
+    // Set stepper parameters
+    stepper.setMaxSpeed(speed);
+    stepper.moveTo(targetSteps); // Absolute position in steps
+
+    // Handle load cell readings if RLC is specified
+    if (rlcCount > 0) {
+      // Take first reading before movement
+      motorPosition = currentPosition;
+      readingIndex = 1;
+      triggerReading = true;
+
+      // Calculate timing for intermediate readings (rlcCount - 2 readings over movement duration)
+      float movementDuration = abs(relativeSteps) / speed; // Seconds
+      float readingInterval = (rlcCount > 2) ? (movementDuration / (rlcCount - 1)) : 0;
+      unsigned long lastReadingTime = millis();
+      int readingsTaken = 1; // First reading triggered
+
+      // Move and take intermediate readings
+      while (stepper.distanceToGo() != 0) {
+        stepper.run();
+        // Update motor position
+        motorPosition = stepper.currentPosition() / STEPS_PER_INCH;
+
+        // Check if it's time for the next reading
+        if (readingsTaken < rlcCount - 1 && (millis() - lastReadingTime) >= (readingInterval * 1000)) {
+          readingIndex = readingsTaken + 1;
+          triggerReading = true;
+          lastReadingTime = millis();
+          readingsTaken++;
+        }
+      }
+
+      // Ensure movement completes
+      while (stepper.distanceToGo() != 0) {
+        stepper.run();
+      }
+
+      // Take final reading after movement
+      motorPosition = stepper.currentPosition() / STEPS_PER_INCH;
+      readingIndex = rlcCount;
+      triggerReading = true;
+    } else {
+      // Move without readings
+      while (stepper.distanceToGo() != 0) {
+        stepper.run();
+      }
+    }
+
+    // Update current position
+    currentPosition = distance;
+
+    Serial.printf("G01: Moving to %.2f inches (%.0f steps) at %.2f inches/sec\n", 
+                  distance, (float)targetSteps, feedrate);
+
+  } else if (command.startsWith("G02")) {
+    // Parse G02 W<seconds>
+    float waitTime = 0.0;
+    int wIndex = command.indexOf('W');
+    if (wIndex != -1) {
+      String wStr = command.substring(wIndex + 1);
+      waitTime = wStr.toFloat();
+    } else {
+      Serial.println("Error parsing G02 command: " + command);
+      return;
+    }
+
+    // Wait for specified time
+    Serial.printf("G02: Waiting for %.2f seconds\n", waitTime);
+    delay((unsigned long)(waitTime * 1000));
+
+  } else if (command.startsWith("G03")) {
+    // Parse G03 C<cycles>
+    long cycles = 0;
+    int cIndex = command.indexOf('C');
+    if (cIndex != -1) {
+      String cStr = command.substring(cIndex + 1);
+      cycles = cStr.toInt();
+    } else {
+      Serial.println("Error parsing G03 command: " + command);
+      return;
+    }
+
+    Serial.printf("G03: Repeating sequence %ld times\n", cycles);
+
+    // Repeat the G-code sequence (excluding G03) for the specified number of cycles
+    for (long cycle = 0; cycle < cycles; cycle++) {
+      Serial.printf("Starting cycle %ld of %ld\n", cycle + 1, cycles);
+      // Execute all commands before G03
+      for (int i = 0; i < commandIndex; i++) {
+        executeGCode(gcode[i], i);
+      }
+    }
+
+  } else {
+    Serial.println("Unknown G-code: " + command);
+  }
+}
