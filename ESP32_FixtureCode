@@ -6,25 +6,25 @@
 #include <ArduinoJson.h>
 
 // Define stepper motor pins
-#define STEP_PIN 26
-#define DIR_PIN 27
-#define ENABLE_PIN 25
+#define STEP_PIN 14
+#define DIR_PIN 13
+#define ENABLE_PIN 12
 
 // Define load cell pins
 #define LOADCELL_DOUT_PIN 32
 #define LOADCELL_SCK_PIN 33
 
-// Steps per inch: 400 steps = 5 inches -> 80 steps/inch
-const float STEPS_PER_INCH = 80.0;
+// Steps per inch (default, updated by G00 SPI)
+float STEPS_PER_INCH = 80.0;
 
-// Load cell calibration parameters (adjust these after calibration)
-const float LOADCELL_DIVIDER = 100.0; // Example scale factor
-const float LOADCELL_OFFSET = 0.0;    // Example offset
+// Load cell calibration parameters (updated by G00 DLC, OLC, RLC)
+float LOADCELL_DIVIDER = 100.0; // Example scale factor
+float LOADCELL_OFFSET = 0.0;    // Example offset
 
 // WiFi and WebSocket connection constants
 const char* ssid = "Test lab";         // WiFi network name
 const char* password = "Mu$t4ng!";     // WiFi password
-const char* ws_host = "192.168.86.100"; // WebSocket server IP address
+const char* ws_host = "192.168.86.93"; // WebSocket server IP address
 const int ws_port = 8080;              // WebSocket server port
 
 // Define stepper motor (1 = driver, DIR_PIN, STEP_PIN)
@@ -38,6 +38,8 @@ WebSocketsClient webSocket;
 
 // G-code commands to execute
 String gcode[] = {
+  "G00 SPI80",           // Set initial steps per inch to 80
+  "G00 DLC100 OLC0.0",   // Set initial load cell divider to 100, offset to 0
   "G01 X100 F10 RLC10",  // Move forward 100 inches at 10 inches/sec, 10 load cell readings
   "G02 W5",              // Wait 5 seconds
   "G01 X-100 F10 RLC10", // Move backward 100 inches at 10 inches/sec, 10 load cell readings
@@ -217,7 +219,198 @@ void loop() {
 void executeGCode(String command, int commandIndex) {
   command.trim(); // Remove leading/trailing whitespace
 
-  if (command.startsWith("G01")) {
+  if (command.startsWith("G00")) {
+    // Parse G00 SPI<steps_per_inch>, DLC<divider> OLC<offset>, RLC<known_load>, or X<distance> F<feedrate>
+    int spiIndex = command.indexOf("SPI");
+    int dlcIndex = command.indexOf("DLC");
+    int olcIndex = command.indexOf("OLC");
+    int rlcIndex = command.indexOf("RLC");
+    int xIndex = command.indexOf('X');
+    int fIndex = command.indexOf('F');
+
+    if (spiIndex != -1) {
+      // Set steps per inch
+      String spiStr = command.substring(spiIndex + 3, dlcIndex != -1 ? dlcIndex : (olcIndex != -1 ? olcIndex : (rlcIndex != -1 ? rlcIndex : (xIndex != -1 ? xIndex : command.length()))));
+      spiStr.trim();
+      float newStepsPerInch = spiStr.toFloat();
+      if (newStepsPerInch > 0) {
+        STEPS_PER_INCH = newStepsPerInch;
+        Serial.printf("G00: Set STEPS_PER_INCH to %.2f\n", STEPS_PER_INCH);
+      } else {
+        Serial.println("Error: Invalid SPI value in G00 command: " + command);
+      }
+    }
+
+    if (dlcIndex != -1) {
+      // Set load cell divider
+      String dlcStr = command.substring(dlcIndex + 3, olcIndex != -1 ? olcIndex : (rlcIndex != -1 ? rlcIndex : (xIndex != -1 ? xIndex : command.length())));
+      dlcStr.trim();
+      float newDivider = dlcStr.toFloat();
+      if (newDivider != 0) {
+        LOADCELL_DIVIDER = newDivider;
+        loadCell.set_scale(LOADCELL_DIVIDER);
+        Serial.printf("G00: Set LOADCELL_DIVIDER to %.2f\n", LOADCELL_DIVIDER);
+      } else {
+        Serial.println("Error: Invalid DLC value in G00 command: " + command);
+      }
+    }
+
+    if (olcIndex != -1) {
+      // Set load cell offset
+      String olcStr = command.substring(olcIndex + 3, rlcIndex != -1 ? rlcIndex : (xIndex != -1 ? xIndex : command.length()));
+      olcStr.trim();
+      float newOffset = olcStr.toFloat();
+      LOADCELL_OFFSET = newOffset;
+      loadCell.set_offset(LOADCELL_OFFSET);
+      Serial.printf("G00: Set LOADCELL_OFFSET to %.2f\n", LOADCELL_OFFSET);
+    }
+
+    if (rlcIndex != -1) {
+      // Calibrate load cell with known load
+      String rlcStr = command.substring(rlcIndex + 3, xIndex != -1 ? xIndex : command.length());
+      rlcStr.trim();
+      float knownLoad = rlcStr.toFloat();
+      if (knownLoad <= 0) {
+        Serial.println("Error: Invalid RLC value in G00 command: " + command);
+        return;
+      }
+
+      // Step 1: Measure zero load
+      Serial.println("Ensure load is 0 and press Enter:");
+      while (true) {
+        if (Serial.available()) {
+          String input = Serial.readStringUntil('\n');
+          input.trim();
+          if (input.isEmpty()) {
+            break;
+          } else {
+            Serial.println("Press Enter to measure zero load:");
+          }
+        }
+        webSocket.loop();
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+      }
+
+      // Take 5 readings for zero load (raw units)
+      float zeroSum = 0.0;
+      loadCell.set_scale(1.0); // Raw readings
+      loadCell.set_offset(0.0);
+      for (int i = 0; i < 5; i++) {
+        zeroSum += loadCell.read();
+        vTaskDelay(100 / portTICK_PERIOD_MS); // 100ms delay between readings
+      }
+      float zeroReading = zeroSum / 5.0;
+      Serial.printf("G00: Zero load reading: %.2f raw units\n", zeroReading);
+
+      // Step 2: Measure known load
+      Serial.printf("Apply load of %.2f units and press Enter:\n", knownLoad);
+      while (true) {
+        if (Serial.available()) {
+          String input = Serial.readStringUntil('\n');
+          input.trim();
+          if (input.isEmpty()) {
+            break;
+          } else {
+            Serial.println("Press Enter to measure known load:");
+          }
+        }
+        webSocket.loop();
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+      }
+
+      // Take 5 readings for known load (raw units)
+      float loadSum = 0.0;
+      for (int i = 0; i < 5; i++) {
+        loadSum += loadCell.read();
+        vTaskDelay(100 / portTICK_PERIOD_MS); // 100ms delay between readings
+      }
+      float loadReading = loadSum / 5.0;
+      Serial.printf("G00: Known load reading: %.2f raw units\n", loadReading);
+
+      // Step 3: Calculate calibration parameters
+      LOADCELL_OFFSET = zeroReading;
+      LOADCELL_DIVIDER = (loadReading - zeroReading) / knownLoad;
+      loadCell.set_offset(LOADCELL_OFFSET);
+      loadCell.set_scale(LOADCELL_DIVIDER);
+      Serial.printf("G00: Calibrated LOADCELL_OFFSET to %.2f, LOADCELL_DIVIDER to %.2f\n",
+                    LOADCELL_OFFSET, LOADCELL_DIVIDER);
+    }
+
+    if (xIndex != -1 && fIndex != -1) {
+      // Calibration move for steps per inch
+      String xStr = command.substring(xIndex + 1, fIndex);
+      String fStr = command.substring(fIndex + 1);
+      float distance = xStr.toFloat();
+      float feedrate = fStr.toFloat();
+
+      if (feedrate <= 0) {
+        Serial.println("Error: Invalid feedrate in G00 command: " + command);
+        return;
+      }
+
+      // Calculate steps
+      long targetSteps = (long)(distance * STEPS_PER_INCH);
+      long currentSteps = (long)(currentPosition * STEPS_PER_INCH);
+      long relativeSteps = targetSteps - currentSteps;
+
+      // Display intended steps
+      Serial.printf("G00: Will move %.2f inches (%ld steps) at %.2f inches/sec. Press Enter to start:\n",
+                    distance, relativeSteps, feedrate);
+
+      // Wait for Enter
+      while (true) {
+        if (Serial.available()) {
+          String input = Serial.readStringUntil('\n');
+          input.trim();
+          if (input.isEmpty()) {
+            break;
+          } else {
+            Serial.println("Press Enter to start movement:");
+          }
+        }
+        webSocket.loop();
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+      }
+
+      // Move motor
+      float speed = feedrate * STEPS_PER_INCH;
+      stepper.setMaxSpeed(speed);
+      stepper.moveTo(targetSteps);
+      while (stepper.distanceToGo() != 0) {
+        stepper.run();
+      }
+
+      // Update current position
+      currentPosition = distance;
+      Serial.printf("G00: Moved to %.2f inches (%ld steps)\n", distance, targetSteps);
+
+      // Prompt for actual distance
+      Serial.println("Enter actual distance traveled (inches):");
+      float actualDistance = 0.0;
+      while (true) {
+        if (Serial.available()) {
+          String input = Serial.readStringUntil('\n');
+          input.trim();
+          actualDistance = input.toFloat();
+          if (actualDistance > 0) {
+            break;
+          } else {
+            Serial.println("Error: Enter a positive number for actual distance:");
+          }
+        }
+        webSocket.loop();
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+      }
+
+      // Calculate new steps per inch
+      STEPS_PER_INCH = abs(relativeSteps) / actualDistance;
+      Serial.printf("G00: Calibrated STEPS_PER_INCH to %.2f (based on %ld steps / %.2f inches)\n",
+                    STEPS_PER_INCH, abs(relativeSteps), actualDistance);
+    } else if (spiIndex == -1 && dlcIndex == -1 && olcIndex == -1 && rlcIndex == -1) {
+      Serial.println("Error parsing G00 command: " + command);
+    }
+
+  } else if (command.startsWith("G01")) {
     // Parse G01 X<distance> F<feedrate> [RLC<count>]
     float distance = 0.0;
     float feedrate = 0.0;
